@@ -1,0 +1,182 @@
+---
+title: "LIME"
+author: "Mohamed Saounera"
+date: "1 novembre 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Chargement des datasets et des packages
+
+```{r}
+library(leaps)
+library(glmnet)
+library(e1071) #SVM
+
+set.seed(5)
+
+# Importing the datasets
+cs_training <- read.csv("cs-training.csv")
+cs_test <- read.csv("cs-test.csv")
+
+str(cs_training)
+summary(cs_training)
+```
+
+On constate qu'il y a des valeurs manquantes pour les variables MonthlyIncome et NumberOfDependents.
+
+```{r}
+aber = which(cs_training$MonthlyIncome >= 25000)
+length(aber)/nrow(cs_training)*100
+sum(cs_training$SeriousDlqin2yrs[aber]==0)/length(aber)*100
+```
+
+Les personnes gagnants plus de 25000 dollars/mois représentent moins de 1% de la dataset et 95% d'entre eux
+ne présentent pas de risque. On peut donc les exclure de l'étude.
+
+```{r}
+hist(na.omit(cs_training$MonthlyIncome[-aber]),main = "Histogram of monthly income", xlab = "Monthly income")
+```
+
+
+## Modèle de prédiction du revenu mensuel
+
+
+```{r cars}
+trainset = cs_training[-aber,]
+setForMonthIncPred = na.omit(trainset)
+setForMonthIncPred = setForMonthIncPred[,-1]
+nrow(setForMonthIncPred)/nrow(trainset)*100
+```
+20% de la dataset est composée de lignes avec des NAs. Ces NA correspondent à des valeurs manquantes pour les variables MonthlyIncome et NumberOfDependents.
+
+### Linear model
+```{r}
+ech = as.integer( rownames(setForMonthIncPred))
+train = sample(ech,size = 2*nrow(setForMonthIncPred)/3)
+
+## linear model
+lmForMonthInc = lm(MonthlyIncome~.,data = setForMonthIncPred[train,-1])
+summary(lmForMonthInc)
+```
+
+Ce modèle possède un R² ajusté très loin de 1. Donc, il n'est pas pertinent.
+
+```{r}
+predMonthInc = predict(lmForMonthInc,newdata = setForMonthIncPred[-train,])
+predMonthInc = as.vector(predMonthInc)
+MSE.lm = sqrt(mean((predMonthInc - setForMonthIncPred$MonthlyIncome[-train])^2))
+MSE.lm
+```
+
+Avec une erreur moyenne aussi grande, cela confirme notre précédent constat.
+
+### subset selection
+```{r}
+reg.full = regsubsets(MonthlyIncome~.,data = setForMonthIncPred[train,-1],nvmax = 9)
+subs.summary = summary(reg.full)
+par(mfrow= c(1,2))
+plot(subs.summary$cp,xlab = "Number of variables", ylab = "Cp", pch=19, type = "b")
+plot(subs.summary$adjr2,xlab = "Number of variables", ylab = "adj_R²" ,pch=19, type = "b")
+```
+
+Le meilleur modèle dont on dispose pour prédire le revenu mensuel présente des performances loin d'être satisfaisantes avec un R² ajusté (0.19) très loin de 1.
+
+## linear model with features creation
+
+```{r}
+lmForMonthInc = lm(MonthlyIncome~.^2,data = setForMonthIncPred[train,-1])
+summary(lmForMonthInc)
+predMonthInc = predict(lmForMonthInc,newdata = setForMonthIncPred[-train,])
+predMonthInc = as.vector(predMonthInc)
+MSE.pm = sqrt(mean((predMonthInc - setForMonthIncPred$MonthlyIncome[-train])^2))
+```
+
+adj_R² = 0.21. Il y a une amélioration mais qui n'est pas suffisante.
+
+## subset selection with features creation
+
+```{r}
+## subset selection with features creation
+reg.full = regsubsets(MonthlyIncome~.^2,data = setForMonthIncPred[train,-1],method = "forward", nvmax = 45)
+subs.summary = summary(reg.full)
+par(mfrow= c(1,2))
+plot(subs.summary$cp,xlab = "Number of variables", ylab = "Cp", pch=19, type = "b")
+plot(subs.summary$adjr2,xlab = "Number of variables", ylab = "adj_R²" ,pch=19, type = "b")
+```
+
+CONCLUSION: Avec les données dont on dispose, tout modèle permettant de prédire le revenu mensuel par rapport aux 
+            aux autres features présente des performances pas satisfaisantes.
+
+## Modèles de scoring crédit
+
+### Logistic regression sur la dataset brute en supprimant les lignes avec NA
+```{r}
+
+# Logistic regression sur la dataset brute en supprimant les lignes avec NA 
+trainset = cs_training[,-1]
+trainset = na.omit(trainset)
+sum(trainset$SeriousDlqin2yrs == 1)/nrow(trainset)*100
+train = sample(1:nrow(trainset),2*nrow(trainset)/3)
+model.logreg = glm(SeriousDlqin2yrs~.,data = trainset[train,], family = 'binomial')
+summary(model.logreg)
+```
+
+```{r}
+pred = predict(model.logreg,newdata = trainset[-train,],type = 'response')
+#head(pred)
+pred = ifelse(pred>0.5,1,0)
+cm = table(pred,trainset[-train,'SeriousDlqin2yrs'])
+cm
+precision = (cm[2,2] )/ (cm[2,1] + cm[2,2])
+recall = (cm[2,2] )/ (cm[2,2]+ cm[1,2])
+accuracy = (cm[1,1] + cm[2,2] )/ (cm[1,2] + cm[2,1]+ cm[1,1] + cm[2,2])
+tab = cbind(precision,recall,accuracy)
+tab
+```
+
+
+### Logitic regression avec échantillonnage
+```{r}
+# Logitic regression avec échantillonnage
+set = cs_training[-aber,-1]
+allDefault = which(set$SeriousDlqin2yrs == 1)
+nbDefault = length(allDefault)
+nbDefault
+allDefaultForTrainset = sample(allDefault,2*nbDefault/3)
+noDefault = which(set$SeriousDlqin2yrs == 0)
+length(noDefault)
+noDefaultForTrainset = sample(noDefault,10*nbDefault/3)
+length(noDefaultForTrainset)/length(allDefaultForTrainset)
+train = c(allDefaultForTrainset,noDefaultForTrainset)
+
+trainset = na.omit(set[train,])
+testset = na.omit(set[-train,])
+sum(trainset$SeriousDlqin2yrs == 1)/nrow(trainset)*100
+model.logreg = glm(SeriousDlqin2yrs~.,data = trainset, family = 'binomial')
+summary(model.logreg)
+```
+
+```{r}
+pred = predict(model.logreg,newdata = testset,type = 'response')
+sum(is.na(pred))/length(pred)
+head(pred)
+pred = ifelse(pred>0.5,1,0)
+cm = table(pred,testset$SeriousDlqin2yrs)
+cm
+precision = (cm[2,2] )/ (cm[2,1] + cm[2,2])
+recall = (cm[2,2] )/ (cm[2,2]+ cm[1,2])
+accuracy = (cm[1,1] + cm[2,2] )/ (cm[1,2] + cm[2,1]+ cm[1,1] + cm[2,2])
+tab = cbind(precision,recall,accuracy)
+tab
+```
+
+```{r}
+svmfit = svm(as.factor(SeriousDlqin2yrs)~.,data = trainset, kernel='linear',cost=10,scale = FALSE)
+```
+
+
+
