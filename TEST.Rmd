@@ -1,0 +1,399 @@
+---
+title: "EXPLICATION DES MODELES AVEC LIME"
+author: "Chloé Trovoada"
+date: "12/5/2019"
+output: pdf_document
+---
+
+Lien internet : https://www.kaggle.com/countryboy/titanic-on-the-rocks-with-a-lime#Import-Data
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Import Data
+Loading the train and test files, then merging to complete missing value treatment and feature engineering.
+```{r}
+library(dplyr)
+library(VIM)
+library(mice)
+library(funModeling)
+library(caret)
+library(lime)
+
+setwd("/Users/chloetrvd/Documents/ESILV/Pi2/CODE")
+
+cs_train <- read.csv("cs-training.csv")
+cs_test <- read.csv("cs-test.csv")
+
+```
+
+# What's Missing ?
+It's known that the SeriousDlqin2yrs column has missing values since we combined the train/test sets and test had N/A values for each record. But the graph below shows that we have additional missing values in the MonthlyIncome and NumberOfDependent columns.
+```{r}
+aggr_plot <- aggr(cs_train, col=c('navyblue','red'), numbers=TRUE, sortVars=TRUE, 
+                  labels=names(cs_train), cex.axis=.7, gap=3, ylab=c("Histogram of missing data","Pattern"))
+```
+
+Confirming the columns with missing data using a different technique...
+```{r}
+library(naniar)
+gg_miss_var(cs_train)
+gg_miss_upset(cs_train)
+```
+
+```{r}
+miss_cols <- colnames(cs_train)[colSums(is.na(cs_train)) > 0]
+miss_cols
+```
+
+We need to replace the NA values.
+```{r}
+# on regroupe les colonnes par type
+int <- names(cs_train)[which(sapply(cs_train, class)%in% c("integer","numeric"))] 
+char <- names(cs_train)[which(sapply(cs_train, class)=="character")]
+
+# on regroupe les colonnes possédant des NA
+isna <- sort(sapply(cs_train, function(x) sum(is.na(x))/length(x)), decreasing = TRUE)
+isna <- isna[isna>0]
+
+library(data.table)
+cs_train <- data.table(cs_train)
+for (c in intersect(names(isna),char)) cs_train[(is.na(get(c))),(c):="ex.na"]
+# na.rm=TRUE veut dire qu'on calcule la médiane sans prendre en compte les NA.
+for (c in setdiff(names(cs_train),char)) cs_train[is.na(get(c)),(c):=median(cs_train[[c]],na.rm=TRUE)]
+
+cs_test <- data.table(cs_test)
+for (c in intersect(names(isna),char)) cs_test[(is.na(get(c))),(c):="ex.na"]
+# na.rm=TRUE veut dire qu'on calcule la médiane sans prendre en compte les NA.
+for (c in setdiff(names(cs_test),char)) cs_test[is.na(get(c)),(c):=median(cs_test[[c]],na.rm=TRUE)]
+```
+
+# What's important ?
+
+Convert columns that should be categorical to factors
+```{r}
+# Suppression de la colonne X (index)
+cs_train$X <- NULL
+cs_train$SeriousDlqin2yrs <- as.logical(cs_train$SeriousDlqin2yrs)
+cs_train$SeriousDlqin2yrs <- as.factor(cs_train$SeriousDlqin2yrs)
+
+cs_test$X <- NULL
+cs_test$SeriousDlqin2yrs <- as.logical(cs_test$SeriousDlqin2yrs)
+cs_test$SeriousDlqin2yrs <- as.factor(cs_test$SeriousDlqin2yrs)
+```
+
+# TRAITEMENT DES VALEURS PEU FREQUENTES
+Attention, sans ça on a une erreur pour l'arbre de décision : 
+  "Error in model.frame.default(Terms, newdata, na.action = na.action, xlev = attr(object, : 
+    le facteur Condition2 a des nouveaux niveaux PosA, RRAe"
+```{r}
+# regrouper toutes les valeurs rares dans un même paquet
+for (c in char) for (v in names(which(table(cs_train[[c]])<15))) cs_train[get(c)==v,(c):="Autre"] 
+
+for (c in char) if(min(table(cs_train[[c]]))<40) {temp<-names(head(sort(table(cs_train[[c]])),2)) 
+for (t in temp) cs_train[get(c)==t,(c):=paste(temp,collapse="_")]}
+
+for (c in char) if ( length(table(cs_train[[c]]))<3 & min(table(cs_train[[c]]))<15) cs_train[,(c):=NULL]
+for (c in names(which(sapply(cs_train,function(x) length(unique(x)))==1))) cs_train[,(c):=NULL]
+
+
+
+for (c in char) for (v in names(which(table(cs_test[[c]])<15))) cs_test[get(c)==v,(c):="Autre"] 
+
+for (c in char) if(min(table(cs_test[[c]]))<40) {temp<-names(head(sort(table(cs_test[[c]])),2)) 
+for (t in temp) cs_test[get(c)==t,(c):=paste(temp,collapse="_")]}
+
+for (c in char) if ( length(table(cs_test[[c]]))<3 & min(table(cs_test[[c]]))<15) cs_test[,(c):=NULL]
+for (c in names(which(sapply(cs_test,function(x) length(unique(x)))==1))) cs_test[,(c):=NULL]
+```
+
+
+# Create Train and Test Sets
+```{r}
+
+smp_size <- floor(0.70 * nrow(cs_train))
+train_ind <- sample(seq_len(nrow(cs_train)), size = smp_size)
+
+train <- cs_train[train_ind, ]
+test <- cs_train[-train_ind, ]
+
+target_train <- as.factor(train$SeriousDlqin2yrs)
+target_test <- as.factor(test$SeriousDlqin2yrs)
+
+train$SeriousDlqin2yrs <- NULL
+test$SeriousDlqin2yrs <- NULL
+
+levels(target_train) <- c("No_Risk", "Risk")
+levels(target_test) <- c("No_Risk", "Risk")
+```
+
+# Create Train Control Object
+```{r}
+myControl <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  repeats = 3,
+  classProbs = TRUE, # IMPORTANT!
+  verboseIter = FALSE,    
+)
+```
+
+# Build Random Forest Model
+```{r}
+modelRF <- train(train, target_train, method = 'rf', metric = "Accuracy", ntree = 500, trControl = myControl)
+```
+
+```{r}
+preds <- predict(modelRF, test, type = "raw")
+```
+
+```{r}
+head(preds)
+```
+
+# Create Confusion Matrix
+```{r}
+confusionMatrix(target_test, preds)
+```
+
+```{r}
+library(MLmetrics)
+F1_Score(target_test, preds)
+```
+
+```{r}
+precision <- posPredValue(preds, target_test, positive="Risk")
+precision
+```
+
+```{r}
+recall <- sensitivity(preds, target_test, positive="Risk")
+recall
+```
+
+# Explain the prediction with LIME
+Should we trust our black box model? Why is it making these specific predictions? LIME will help provide a window into the decision making process.
+```{r}
+explainer <- lime(train, modelRF)
+explanation <- explain(test[5:8,], explainer, n_labels = 1, n_features = length(names(test)))
+plot_features(explanation)
+```
+
+
+# GBM AVEC LE PACKAGE CARET
+```{r}
+fitControl <- trainControl(## 10-fold CV
+                           method = "repeatedcv",
+                           number = 10,
+                           ## repeated ten times
+                           repeats = 3,
+                           verboseIter = FALSE,
+                           )
+
+modelGBM <- train(x = train, y = target_train, 
+                 method = "gbm", 
+                 trControl = fitControl,
+                 verbose = FALSE)
+modelGBM
+```
+
+Prédictions
+```{r}
+predGBM <- predict(modelGBM, test, type = "raw")
+summary(predGBM)
+```
+
+```{r}
+confusionMatrix(target_test, predGBM)
+```
+
+
+```{r}
+F1_Score(target_test, predGBM)
+```
+
+```{r}
+precision <- posPredValue(predGBM, target_test, positive="Risk")
+precision
+```
+
+
+```{r}
+recall <- sensitivity(predGBM, target_test, positive="Risk")
+recall
+```
+
+
+# Explain the prediction with LIME
+Should we trust our black box model? Why is it making these specific predictions? LIME will help provide a window into the decision making process.
+```{r}
+explainer <- lime(train, modelGBM)
+explanation <- explain(test[5:8,], explainer, n_labels = 1, n_features = length(names(test)))
+plot_features(explanation)
+```
+
+
+
+
+# SVM AVEC LE PACKAGE CARET
+```{r}
+modelSVM <- train(x = train, y = target_train, 
+                 method = "svmRadial", 
+                 trControl = myControl, 
+                 preProc = c("center", "scale"),
+                 tuneLength = 3)
+modelSVM               
+```
+
+Prédictions
+```{r}
+predSVM <- predict(modelSVM, test, type = "raw")
+summary(predSVM)
+```
+
+# Create Confusion Matrix
+```{r}
+confusionMatrix(target_test, predSVM)
+```
+
+```{r}
+F1_Score(target_test, predSVM)
+```
+
+```{r}
+precision <- posPredValue(predSVM, target_test, positive="Risk")
+precision
+```
+
+
+```{r}
+recall <- sensitivity(predSVM, target_test, positive="Risk")
+recall
+```
+
+
+# Explain the prediction with LIME
+Should we trust our black box model? Why is it making these specific predictions? LIME will help provide a window into the decision making process.
+```{r}
+explainer <- lime(train, modelSVM)
+explanation <- explain(test[5:8,], explainer, n_labels = 1, n_features = length(names(test)))
+plot_features(explanation)
+```
+
+# XGBoost avec caret
+
+https://datafuture.fr/post/faire-tourner-xgboost-sous-r/
+
+Chargement des librairies
+```{r}
+library(tidyverse)
+library(xgboost)
+library(caret)
+library(readxl)
+library(dplyr)
+
+```
+
+Exploiration de la base de donn?es
+```{r}
+library(corrplot)
+corrplot(cor(train), method = "ellipse")
+
+#library(GGally)
+#ggpairs(trainset)
+```
+
+Convertion data
+```{r}
+#train$SeriousDlqin2yrs<- as.factor(train$SeriousDlqin2yrs)
+#test$SeriousDlqin2yrs<- as.factor(test$SeriousDlqin2yrs)
+```
+
+
+
+On convertit les matrices du train et test set en variables binaires
+```{r}
+X_train = xgb.DMatrix(as.matrix(train))
+y_train = target_train
+
+X_test = xgb.DMatrix(as.matrix(test))
+y_test = target_test
+```
+
+
+On va donc commencer par d?finir un objet trainControl, qui permet de contr?ler la mani?re dont se fait l'entra?nement du mod?le, assur? par la fonction train().
+
+Ici, nous choisissons une validation crois?e (method = 'cv') ? 5 folds (number = 5). On choisit ?galement d'autoriser la parall?lisation des calculs (allowParallel = TRUE), de r?duire la verbosit? (verboseIter = FALSE).
+
+```{r}
+xgb_trcontrol = trainControl(method = "cv", number = 5, allowParallel = TRUE, 
+    verboseIter = FALSE, returnData = FALSE)
+```
+
+On d?finit ensuite une grille de param?tres du mod?le
+
+```{r}
+xgbGrid <- expand.grid(nrounds = c(100,200),  
+                       max_depth = c(3, 5, 10, 15, 20),
+                       colsample_bytree = seq(0.5, 0.9, length.out = 5),
+                       ## valeurs par d?faut : 
+                       eta = 0.1,
+                       gamma=0,
+                       min_child_weight = 1,
+                       subsample = 1
+                      )
+```
+
+Entrainement du mod?le
+
+```{r}
+set.seed(0)
+xgb_model = train(X_train, y_train, trControl = xgb_trcontrol, tuneGrid = xgbGrid, 
+    method = "xgbTree")
+```
+
+Param?tres optimal trouv? par caret 
+```{r}
+xgb_model
+
+xgb_model$bestTune
+```
+
+Performance
+
+```{r}
+predXGB <- predict(xgb_model, test, type = "raw")
+summary(predXGB)
+```
+
+
+# Create Confusion Matrix
+```{r}
+confusionMatrix(y_test, predXGB)
+```
+
+```{r}
+F1_Score(y_test, predXGB)
+```
+
+
+```{r}
+precision <- posPredValue(predXGB, y_test, positive="Risk")
+precision
+```
+
+
+```{r}
+recall <- sensitivity(predXGB, y_test, positive="Risk")
+recall
+```
+
+# Explain the prediction with LIME
+Should we trust our black box model? Why is it making these specific predictions? LIME will help provide a window into the decision making process.
+```{r}
+explainer <- lime(train, xgb_model)
+explanation <- explain(test[5:8,], explainer, n_labels = 1, n_features = length(names(test)))
+plot_features(explanation)
+```
+
